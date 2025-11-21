@@ -14,7 +14,7 @@ on:
 run-name: >-
   ${{ github.event_name == 'repository_dispatch'
       && format(
-        'PR #{0} - Label {1} - {2}',
+        'GPU Test - PR #{0} - {1} - {2}',
         github.event.client_payload.pull_number,
         github.event.client_payload.ci_label,
         github.event.client_payload.correlation_id
@@ -28,6 +28,113 @@ jobs:
       github.event.action == 'ci-gpu' ||
       github.event.action == 'ci-all'
     name: GPU Test with Python ${{ matrix.python-version }} (${{ matrix.setup-script }})
+
+    runs-on: [self-hosted, 1ES.Pool=agl-runner-gpu]
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        include:
+        - python-version: '3.10'
+          setup-script: 'legacy'
+        - python-version: '3.12'
+          setup-script: 'stable'
+        - python-version: '3.13'
+          setup-script: 'latest'
+      fail-fast: false
+    steps:
+      - name: Check GPU status
+        run: nvidia-smi
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.pr_ref || (github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number)) || github.ref }}
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+      - name: Upgrade dependencies (latest)
+        run: uv lock --upgrade
+        if: matrix.setup-script == 'latest'
+      - name: Sync dependencies (latest)
+        run: uv sync --frozen --no-default-groups --extra apo --extra mongo --group dev --group agents --group torch-gpu-stable
+        if: matrix.setup-script == 'latest'
+      - name: Sync dependencies (stable & legacy)
+        run: uv sync --frozen --no-default-groups --extra apo --extra mongo --group dev --group agents --group torch-gpu-${{ matrix.setup-script }}
+        if: matrix.setup-script != 'latest'
+      - name: Freeze dependencies
+        run: |
+          set -ex
+          uv pip freeze | tee requirements-freeze.txt
+          echo "UV_LOCKED=1" >> $GITHUB_ENV
+          echo "UV_NO_SYNC=1" >> $GITHUB_ENV
+      - name: Upload dependencies artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependencies-tests-full-${{ matrix.python-version }}-${{ matrix.setup-script }}
+          path: requirements-freeze.txt
+          compression-level: 0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - name: Install JavaScript dependencies
+        run: cd dashboard && npm ci
+      - name: Build dashboard
+        run: cd dashboard && npm run build
+
+      - name: Start MongoDB container
+        run: |
+          set -euo pipefail
+          cat /etc/security/limits.conf
+          docker run -d \
+            --name mongodb-test \
+            --ulimit nofile=65535:65535 \
+            -p 27017:27017 \
+            mongo:8.2 \
+            --replSet test-rs
+
+          # Wait for mongod to come up
+          for i in $(seq 1 30); do
+            if docker exec mongodb-test mongosh --quiet --eval 'db.runCommand({ ping: 1 })' >/dev/null 2>&1; then
+              echo "Mongo is up"
+              break
+            fi
+            echo "Waiting for Mongo..."
+            sleep 2
+          done
+
+          # Init replica set (simple single-node)
+          docker exec mongodb-test mongosh --quiet --eval '
+            rs.initiate({
+              _id: "test-rs",
+              members: [{ _id: 0, host: "localhost:27017" }]
+            })
+          '
+        shell: bash
+
+      - name: Launch LiteLLM Proxy
+        run: |
+          ./scripts/litellm_run.sh
+        env:
+          AZURE_API_BASE: ${{ secrets.AZURE_GROUP_SUBSCRIPTION_API_BASE }}
+          AZURE_API_KEY: ${{ secrets.AZURE_GROUP_SUBSCRIPTION_API_KEY }}
+
+      - name: Run tests
+        run: |
+          uv run pytest -v --durations=0 tests
+        env:
+          PYTEST_ADDOPTS: "--color=yes"
+          OPENAI_BASE_URL: http://localhost:12306/
+          OPENAI_API_KEY: dummy
+          AGL_TEST_MONGO_URI: mongodb://localhost:27017/?replicaSet=test-rs
+
+
+  minimal-examples:
+    if: >
+      github.event_name != 'repository_dispatch' ||
+      github.event.action == 'ci-gpu' ||
+      github.event.action == 'ci-all'
+    name: Minimal Examples with Python ${{ matrix.python-version }} (${{ matrix.setup-script }})
 
     runs-on: [self-hosted, 1ES.Pool=agl-runner-gpu]
     timeout-minutes: 30
@@ -69,17 +176,9 @@ jobs:
       - name: Upload dependencies artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dependencies-${{ matrix.python-version }}-${{ matrix.setup-script }}
+          name: dependencies-minimal-examples-${{ matrix.python-version }}-${{ matrix.setup-script }}
           path: requirements-freeze.txt
           compression-level: 0
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '22'
-      - name: Install JavaScript dependencies
-        run: cd dashboard && npm ci
-      - name: Build dashboard
-        run: cd dashboard && npm run build
 
       - name: Launch LiteLLM Proxy
         run: |
@@ -88,10 +187,120 @@ jobs:
           AZURE_API_BASE: ${{ secrets.AZURE_GROUP_SUBSCRIPTION_API_BASE }}
           AZURE_API_KEY: ${{ secrets.AZURE_GROUP_SUBSCRIPTION_API_KEY }}
 
-      - name: Run tests
+      - name: Write Traces via Otel Tracer
         run: |
-          uv run pytest -v --durations=0 tests
+          set -euo pipefail
+          source .venv/bin/activate
+          cd examples/minimal
+          python write_traces.py otel
+          sleep 5
+
+      - name: Write Traces via AgentOps Tracer
         env:
-          PYTEST_ADDOPTS: "--color=yes"
           OPENAI_BASE_URL: http://localhost:12306/
           OPENAI_API_KEY: dummy
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          cd examples/minimal
+          python write_traces.py agentops
+          sleep 5
+
+      - name: Write Traces via Otel Tracer with Client
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          cd examples/minimal
+          agl store --port 45993 --log-level DEBUG &
+          sleep 5
+          python write_traces.py otel --use-client
+          pkill -f agl && echo "SIGTERM sent to agl" || echo "No agl process found"
+          while pgrep -f agl; do
+            echo "Waiting for agl to finish..."
+            sleep 5
+          done
+
+      - name: Write Traces via AgentOps Tracer with Client
+        env:
+          OPENAI_BASE_URL: http://localhost:12306/
+          OPENAI_API_KEY: dummy
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          cd examples/minimal
+          agl store --port 45993 --log-level DEBUG &
+          sleep 5
+          python write_traces.py agentops --use-client
+          pkill -f agl && echo "SIGTERM sent to agl" || echo "No agl process found"
+          while pgrep -f agl; do
+            echo "Waiting for agl to finish..."
+            sleep 5
+          done
+
+      - name: vLLM Server
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          cd examples/minimal
+          python vllm_server.py Qwen/Qwen2.5-0.5B-Instruct
+
+      - name: LLM Proxy (OpenAI backend)
+        env:
+          OPENAI_API_BASE: http://localhost:12306/
+          OPENAI_API_KEY: dummy
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          cd examples/minimal
+
+          python llm_proxy.py openai gpt-4.1-mini &
+
+          LLM_PROXY_READY=0
+          for attempt in $(seq 1 30); do
+            if curl -sSf http://localhost:43886/health > /dev/null 2>&1; then
+              LLM_PROXY_READY=1
+              break
+            fi
+            sleep 2
+          done
+          if [[ "$LLM_PROXY_READY" != "1" ]]; then
+            echo "LLM proxy failed to become healthy" >&2
+            exit 1
+          fi
+
+          python llm_proxy.py test gpt-4.1-mini
+
+          pkill -f llm_proxy.py && echo "SIGTERM sent to llm_proxy.py" || echo "No llm_proxy.py process found"
+          while pgrep -f llm_proxy.py; do
+            echo "Waiting for llm_proxy.py to finish..."
+            sleep 5
+          done
+
+      - name: LLM Proxy (vLLM backend)
+        if: matrix.setup-script != 'legacy'  # Skip if return_token_ids is not supported
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          cd examples/minimal
+          python llm_proxy.py vllm Qwen/Qwen2.5-0.5B-Instruct &
+
+          LLM_PROXY_READY=0
+          for attempt in $(seq 1 30); do
+            if curl -sSf http://localhost:43886/health > /dev/null 2>&1; then
+              LLM_PROXY_READY=1
+              break
+            fi
+            sleep 2
+          done
+          if [[ "$LLM_PROXY_READY" != "1" ]]; then
+            echo "LLM proxy failed to become healthy" >&2
+            exit 1
+          fi
+
+          python llm_proxy.py test Qwen/Qwen2.5-0.5B-Instruct
+
+          pkill -f llm_proxy.py && echo "SIGTERM sent to llm_proxy.py" || echo "No llm_proxy.py process found"
+          while pgrep -f llm_proxy.py; do
+            echo "Waiting for llm_proxy.py to finish..."
+            sleep 5
+          done
